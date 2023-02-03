@@ -33,7 +33,8 @@
 #define READ_TRAY_OFFSET_EVERY  1000
 #define EMPTY_TRAY_WEIGHT       23456.f
 #define TRAY_FULL_THRESHOLD     700.f
-#define HEALTHCHECK_EVERY       30000 // system checks happen every 30sec
+#define HEALTHCHECK_EVERY       10000 // system checks happen every 30sec
+#define MAX_SYSTEM_PRESSURE     10f
 #define BOILER_FILL_TIMEOUT     8000UL
 #define BOILER_FILL_PRESSURE    1.75f
 

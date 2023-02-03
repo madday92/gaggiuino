@@ -627,7 +627,7 @@ void systemHealthCheck(float pressureThreshold) {
   #if defined LEGO_VALVE_RELAY || defined SINGLE_BOARD
   if (!brewState() && !steamState()) {
     if (millis() >= systemHealthTimer) {
-      while (currentState.smoothedPressure >= pressureThreshold && currentState.temperature < 100.f)
+      while (currentState.smoothedPressure >= pressureThreshold)
       {
         //Reloading the watchdog timer, if this function fails to run MCU is rebooted
         watchdogReload();
@@ -648,6 +648,24 @@ void systemHealthCheck(float pressureThreshold) {
       }
       closeValve();
       systemHealthTimer = millis() + HEALTHCHECK_EVERY;
+    }
+  } else {
+    while (currentState.smoothedPressure >= MAX_SYSTEM_PRESSURE) {
+      watchdogReload();
+      switch (lcdCurrentPageId) {
+        case 2:
+        case 8:
+          setPumpOff();
+          setBoilerOff();
+          break;
+        default:
+          lcdShowPopup("Releasing pressure!");
+          setPumpOff();
+          setBoilerOff();
+          openValve();
+          break;
+      }
+      sensorsRead();
     }
   }
   #endif
