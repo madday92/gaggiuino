@@ -12,6 +12,7 @@
 #define dimmerPin     PA1
 #define steamPin      PA4
 #define valvePin      PC13
+#define waterPin      PA12
 
 #define HX711_sck_1   PB0
 #define HX711_sck_2   PB1
