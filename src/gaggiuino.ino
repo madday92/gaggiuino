@@ -662,7 +662,7 @@ void systemHealthCheck(float pressureThreshold) {
   #if defined LEGO_VALVE_RELAY || defined SINGLE_BOARD
 
   // No point going through the whole thing if this first condition isn't met.
-  if ((currentState.brewSwitchState && !brewActive) || currentState.steamSwitchState || currentState.hotWaterSwitchState) {
+  if ((currentState.brewSwitchState && brewActive) || currentState.steamSwitchState || currentState.hotWaterSwitchState) {
     systemHealthTimer = millis() + HEALTHCHECK_EVERY;
     return;
   }
