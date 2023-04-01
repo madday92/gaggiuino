@@ -1,3 +1,4 @@
+/* 09:32 15/03/2023 - change triggering comment */
 #include "esp_comms.h"
 #include "pindef.h"
 namespace {
@@ -28,16 +29,16 @@ void espCommsReadData() {
 }
 
 volatile uint32_t sensorDataTimer = 0;
-void espCommsSendSensorData(const SensorState& state, bool brewActive, bool steamActive, uint32_t frequency) {
+void espCommsSendSensorData(const SensorState& state, uint32_t frequency) {
   uint32_t now = millis();
   if (now - sensorDataTimer > frequency) {
     SensorStateSnapshot sensorSnapshot = SensorStateSnapshot{
-      .brewActive = brewActive,
-      .steamActive = steamActive,
+      .brewActive = state.brewSwitchState,
+      .steamActive = state.steamSwitchState,
       .temperature = state.temperature,
       .pressure = state.smoothedPressure,
       .pumpFlow = state.smoothedPumpFlow,
-      .weightFlow = state.weightFlow,
+      .weightFlow = state.smoothedWeightFlow,
       .weight = state.weight,
     };
     McuCommsSingleton::getInstance().sendSensorStateSnapshot(sensorSnapshot);

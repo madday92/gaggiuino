@@ -1,11 +1,13 @@
+/* 09:32 15/03/2023 - change triggering comment */
 #if defined(DEBUG_ENABLED)
   #include "dbg.h"
 #endif
 #include "gaggiuino.h"
 
-SimpleKalmanFilter smoothPressure(0.2f, 0.2f, 0.06f);
-SimpleKalmanFilter smoothPumpFlow(0.1f, 0.1f, 0.20f);
-SimpleKalmanFilter smoothScalesFlow(1.f, 1.f, 0.05f);
+SimpleKalmanFilter smoothPressure(0.6f, 0.6f, 0.1f);
+SimpleKalmanFilter smoothPumpFlow(1.f, 1.f, 0.04f);
+SimpleKalmanFilter smoothScalesFlow(0.5f, 0.5f, 0.01f);
+SimpleKalmanFilter smoothConsideredFlow(1.f, 1.f, 0.1f);
 
 //default phases. Updated in updateProfilerPhases.
 Profile profile;
@@ -28,6 +30,8 @@ void setup(void) {
   LOG_INFO("Pin init");
 
   setBoilerOff();  // relayPin LOW
+  setSteamValveRelayOff();
+  setSteamBoilerRelayOff();
   LOG_INFO("Boiler turned off");
 
   //Pump
@@ -50,10 +54,17 @@ void setup(void) {
   // Initialise comms library for talking to the ESP mcu
   espCommsInit();
 
+  // Initialize LED
+  ledInit();
+  ledColor(255, 255, 255); // WHITE
+
   // Initialising the vsaved values or writing defaults if first start
   eepromInit();
   eepromValues_t eepromCurrentValues = eepromGetCurrentValues();
   LOG_INFO("EEPROM Init");
+
+  cpsInit(eepromCurrentValues);
+  LOG_INFO("CPS Init");
 
   thermocoupleInit();
   LOG_INFO("Thermocouple Init");
@@ -75,6 +86,8 @@ void setup(void) {
   pageValuesRefresh(true);
   LOG_INFO("Setup sequence finished");
 
+  ledColor(255, 87, 95); // 64171
+
   iwdcInit();
 }
 
@@ -91,7 +104,7 @@ void loop(void) {
   brewDetect();
   modeSelect();
   lcdRefresh();
-  espCommsSendSensorData(currentState, brewActive, steamState());
+  espCommsSendSensorData(currentState);
   systemHealthCheck(0.7f);
 }
 
@@ -101,6 +114,7 @@ void loop(void) {
 
 
 static void sensorsRead(void) {
+  sensorReadSwitches();
   espCommsReadData();
   sensorsReadTemperature();
   sensorsReadWeight();
@@ -108,6 +122,12 @@ static void sensorsRead(void) {
   calculateWeightAndFlow();
   fillBoiler();
   updateStartupTimer();
+}
+
+static void sensorReadSwitches(void) {
+  currentState.brewSwitchState = brewState();
+  currentState.steamSwitchState = steamState();
+  currentState.hotWaterSwitchState = waterPinState() || (currentState.brewSwitchState && currentState.steamSwitchState); // use either an actual switch, or the GC/GCP switch combo
 }
 
 static void sensorsReadTemperature(void) {
@@ -134,22 +154,25 @@ static void sensorsReadPressure(void) {
     previousSmoothedPressure = currentState.smoothedPressure;
     currentState.pressure = getPressure();
     currentState.smoothedPressure = smoothPressure.updateEstimate(currentState.pressure);
-    currentState.isPressureRising = currentState.smoothedPressure >= previousSmoothedPressure + 0.05f;
-    currentState.isPressureRisingFast = currentState.smoothedPressure >= previousSmoothedPressure + 1.55f;
-    currentState.isPressureFalling = currentState.smoothedPressure <= previousSmoothedPressure - 0.05f;
-    currentState.isPressureFallingFast = currentState.smoothedPressure <= previousSmoothedPressure - 0.1f;
+    currentState.isPressureRising = currentState.smoothedPressure >= previousSmoothedPressure + 0.01f;
+    currentState.isPressureRisingFast = currentState.smoothedPressure >= previousSmoothedPressure + 0.05f;
+    currentState.isPressureFalling = currentState.smoothedPressure <= previousSmoothedPressure - 0.005f;
+    currentState.isPressureFallingFast = currentState.smoothedPressure <= previousSmoothedPressure - 0.01f;
+    currentState.isPressureMaxed = currentState.smoothedPressure >= runningCfg.pressureProfilingState ? runningCfg.pressureProfilingStart - 0.5f : runningCfg.flowProfilePressureTarget - 0.5f;
+
     pressureTimer = millis() + GET_PRESSURE_READ_EVERY;
   }
 }
 
 static long sensorsReadFlow(float elapsedTime) {
-    long pumpClicks = getAndResetClickCounter();
-    float cps = 1000.f * (float)pumpClicks / elapsedTime;
-    currentState.pumpFlow = getPumpFlow(cps, currentState.smoothedPressure);
+  long pumpClicks = getAndResetClickCounter();
+  currentState.pumpClicks = 1000.f * (float)pumpClicks / elapsedTime;
 
-    previousSmoothedPumpFlow = currentState.smoothedPumpFlow;
-    currentState.smoothedPumpFlow = smoothPumpFlow.updateEstimate(currentState.pumpFlow);
-    return pumpClicks;
+  currentState.pumpFlow = getPumpFlow(currentState.pumpClicks, currentState.smoothedPressure);
+
+  previousSmoothedPumpFlow = currentState.smoothedPumpFlow;
+  currentState.smoothedPumpFlow = smoothPumpFlow.updateEstimate(currentState.pumpFlow);
+  return pumpClicks;
 }
 
 static void calculateWeightAndFlow(void) {
@@ -163,8 +186,9 @@ static void calculateWeightAndFlow(void) {
     if (elapsedTime > REFRESH_FLOW_EVERY) {
       flowTimer = millis();
       long pumpClicks = sensorsReadFlow(elapsedTime);
-      currentState.isPumpFlowRisingFast = currentState.smoothedPumpFlow > previousSmoothedPumpFlow + 2.5f;
-      currentState.isPumpFlowFallingFast = currentState.smoothedPumpFlow < previousSmoothedPumpFlow - 0.55f;
+      float consideredFlow = currentState.smoothedPumpFlow * (float)elapsedTime / 1000.f;
+      currentState.isPumpFlowRisingFast = currentState.smoothedPumpFlow > previousSmoothedPumpFlow + 0.1f;
+      currentState.isPumpFlowFallingFast = currentState.smoothedPumpFlow < previousSmoothedPumpFlow - 0.1f;
 
       // bool previousIsOutputFlow = predictiveWeight.isOutputFlow();
 
@@ -177,17 +201,22 @@ static void calculateWeightAndFlow(void) {
         previousWeight = currentState.shotWeight;
       } else if (predictiveWeight.isOutputFlow()) {
         float flowPerClick = getPumpFlowPerClick(currentState.smoothedPressure);
-        // if the output flow just started, consider only 50% of the clicks (probabilistically).
-        // long consideredClicks = previousIsOutputFlow ? pumpClicks : pumpClicks * 0.5f;
-        currentState.shotWeight += pumpClicks * flowPerClick;
+        float actualFlow = (consideredFlow > pumpClicks * flowPerClick) ? consideredFlow : pumpClicks * flowPerClick;
+        // Probabilistically the flow is lower if the shot is just started winding up and we're flow profiling
+        if (runningCfg.flowProfileState && currentState.isPressureRising
+        && currentState.smoothedPressure < runningCfg.flowProfilePressureTarget * 0.9f) {
+          actualFlow *= 0.6f;
+        }
+        currentState.consideredFlow = smoothConsideredFlow.updateEstimate(actualFlow);
+        //If the pressure is maxing out, consider only the flow is slightly higher than the sensor reports (probabilistically).
+        currentState.shotWeight += actualFlow;
       }
-      currentState.waterPumped += currentState.smoothedPumpFlow * (float)elapsedTime / 1000.f;
+      currentState.waterPumped += consideredFlow;
     }
   } else {
-    if (elapsedTime > REFRESH_FLOW_EVERY) {
-      flowTimer = millis();
-      sensorsReadFlow(elapsedTime);
-    }
+    currentState.consideredFlow = 0.f;
+
+    flowTimer = millis();
   }
 }
 
@@ -196,13 +225,13 @@ static void calculateWeightAndFlow(void) {
 //##############################################################################################################################
 
 static void pageValuesRefresh(bool forcedUpdate) {  // Refreshing our values on page changes
-
   if ( lcdCurrentPageId != lcdLastCurrentPageId || forcedUpdate == true ) {
     runningCfg = lcdDownloadCfg();
 
 
     homeScreenScalesEnabled = lcdGetHomeScreenScalesEnabled();
-    selectedOperationalMode = (OPERATION_MODES) lcdGetSelectedOperationalMode(); // MODE_SELECT should always be LAST
+    // MODE_SELECT should always be LAST
+    selectedOperationalMode = (OPERATION_MODES) lcdGetSelectedOperationalMode();
 
     updateProfilerPhases();
 
@@ -227,8 +256,8 @@ static void modeSelect(void) {
     case OPERATION_MODES::OPMODE_everythingFlowProfiled:
     case OPERATION_MODES::OPMODE_pressureBasedPreinfusionAndFlowProfile:
       nonBrewModeActive = false;
-      if (waterState()) hotWaterMode(currentState);
-      else if (steamState()) steamCtrl(runningCfg, currentState, brewActive);
+      if (currentState.hotWaterSwitchState) hotWaterMode(currentState);
+      else if (currentState.steamSwitchState) steamCtrl(runningCfg, currentState);
       else {
         profiling();
         steamTime = millis();
@@ -236,28 +265,28 @@ static void modeSelect(void) {
       break;
     case OPERATION_MODES::OPMODE_manual:
       nonBrewModeActive = false;
-      if (!steamState()) steamTime = millis();
+      if (!currentState.steamSwitchState) steamTime = millis();
       manualFlowControl();
       break;
     case OPERATION_MODES::OPMODE_flush:
       nonBrewModeActive = true;
-      if (!steamState()) steamTime = millis();
+      if (!currentState.steamSwitchState) steamTime = millis();
       backFlush(currentState);
-      brewActive ? setBoilerOff() : justDoCoffee(runningCfg, currentState, brewActive, preinfusionFinished);
+      brewActive ? setBoilerOff() : justDoCoffee(runningCfg, currentState, false, preinfusionFinished);
       break;
     case OPERATION_MODES::OPMODE_steam:
       nonBrewModeActive = true;
-      if (!steamState()) {
+      if (!currentState.steamSwitchState) {
         brewActive ? flushActivated() : flushDeactivated();
-        justDoCoffee(runningCfg, currentState, brewActive, preinfusionFinished);
+        // justDoCoffee(runningCfg, currentState, brewActive, preinfusionFinished);
         steamTime = millis();
       } else {
-        steamCtrl(runningCfg, currentState, brewActive);
+        steamCtrl(runningCfg, currentState);
       }
       break;
     case OPERATION_MODES::OPMODE_descale:
       nonBrewModeActive = true;
-      if (!steamState()) steamTime = millis();
+      if (!currentState.steamSwitchState) steamTime = millis();
       deScale(runningCfg, currentState);
       break;
     case OPERATION_MODES::OPMODE_empty:
@@ -287,17 +316,20 @@ static void lcdRefresh(void) {
     #endif
 
     /*LCD temp output*/
-    lcdSetTemperature(currentState.temperature);
+    uint16_t lcdTemp = ((uint16_t)currentState.temperature > runningCfg.setpoint - runningCfg.offsetTemp && currentState.brewSwitchState)
+      ? (uint16_t)currentState.temperature / (runningCfg.setpoint - runningCfg.offsetTemp) + (runningCfg.setpoint - runningCfg.offsetTemp)
+      : (uint16_t)currentState.temperature;
+    lcdSetTemperature(lcdTemp);
 
     /*LCD weight output*/
     if (static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_home && homeScreenScalesEnabled) {
       lcdSetWeight(currentState.weight);
-    } else if (static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_graph || static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_manual){
-      if (scalesIsPresent()) {
-        lcdSetWeight(currentState.weight);
-      } else if (currentState.shotWeight) {
-        lcdSetWeight(currentState.shotWeight);
-      }
+    }
+    else if (static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_graph
+    || static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_manual) {
+      if (currentState.shotWeight)
+        // If the weight output is a negative value lower than -0.8 you might want to tare again before extraction starts.
+        lcdSetWeight(currentState.shotWeight > -0.8f ? currentState.shotWeight : -0.9f);
     }
 
     /*LCD flow output*/
@@ -307,11 +339,11 @@ static void lcdRefresh(void) {
       lcdSetFlow(
         currentState.weight > 0.4f // currentState.weight is always zero if scales are not present
           ? currentState.smoothedWeightFlow * 10.f
-          : currentState.smoothedPumpFlow * 10.f
+          : currentState.consideredFlow ? currentState.consideredFlow * 100.f : currentState.smoothedPumpFlow * 10.f
       );
     }
 
-  #if defined DEBUG_ENABLED && defined stm32f411xx
+  #ifdef DEBUG_ENABLED
     lcdShowDebug(readTempSensor(), getAdsError());
   #endif
 
@@ -397,9 +429,9 @@ void lcdTrigger1(void) {
 
   rc = eepromWrite(eepromCurrentValues);
   if (rc == true) {
-    lcdShowPopup("UPDATE SUCCESSFUL!");
+    lcdShowPopup("Update successful!");
   } else {
-    lcdShowPopup("ERROR!");
+    lcdShowPopup("Data out of range!");
   }
 }
 
@@ -518,8 +550,8 @@ static void profiling(void) {
     espCommsSendShotData(shotSnapshot, 100);
 
     if (phaseProfiler.isFinished()) {
-      closeValve();
       setPumpOff();
+      closeValve();
       brewActive = false;
     } else if (currentPhase.getType() == PHASE_TYPE::PHASE_TYPE_PRESSURE) {
       float newBarValue = currentPhase.getTarget();
@@ -543,11 +575,11 @@ static void profiling(void) {
 static void manualFlowControl(void) {
   if (brewActive) {
     openValve();
-    float flow_reading = lcdGetManualFlowVol() / 10 ;
+    float flow_reading = lcdGetManualFlowVol() / 10.f ;
     setPumpFlow(flow_reading, 0.f, currentState);
   } else {
-    closeValve();
     setPumpOff();
+    closeValve();
   }
   justDoCoffee(runningCfg, currentState, brewActive, preinfusionFinished);
 }
@@ -559,7 +591,7 @@ static void manualFlowControl(void) {
 static void brewDetect(void) {
   static bool paramsReset = true;
 
-  if (brewState()) {
+  if (currentState.brewSwitchState) {
     if(!paramsReset) {
       brewParamsReset();
       paramsReset = true;
@@ -578,16 +610,16 @@ static void brewDetect(void) {
 }
 
 static void brewParamsReset(void) {
-  tareDone                                    = false;
-  currentState.shotWeight                     = 0.f;
-  currentState.pumpFlow                       = 0.f;
-  previousWeight                              = 0.f;
-  currentState.weight                         = 0.f;
-  currentState.waterPumped                    = 0.f;
-  preinfusionFinished                         = false;
-  brewingTimer                                = millis();
-  flowTimer                                   = millis() + REFRESH_FLOW_EVERY;
-  systemHealthTimer                           = millis() + HEALTHCHECK_EVERY;
+  tareDone                 = false;
+  currentState.shotWeight  = 0.f;
+  currentState.pumpFlow    = 0.f;
+  previousWeight           = 0.f;
+  currentState.weight      = 0.f;
+  currentState.waterPumped = 0.f;
+  preinfusionFinished      = false;
+  brewingTimer             = millis();
+  flowTimer                = millis() + REFRESH_FLOW_EVERY;
+  systemHealthTimer        = millis() + HEALTHCHECK_EVERY;
 
   predictiveWeight.reset();
   phaseProfiler.reset();
@@ -599,16 +631,17 @@ void systemHealthCheck(float pressureThreshold) {
 
   /* This *while* is here to prevent situations where the system failed to get a temp reading and temp reads as 0 or -7(cause of the offset)
   If we would use a non blocking function then the system would keep the SSR in HIGH mode which would most definitely cause boiler overheating */
-  while (currentState.temperature <= 0.0f || currentState.temperature  == NAN || currentState.temperature  >= 170.0f) {
+  while (currentState.temperature <= 0.0f || currentState.temperature == NAN || currentState.temperature >= 170.0f) {
     //Reloading the watchdog timer, if this function fails to run MCU is rebooted
     watchdogReload();
     /* In the event of the temp failing to read while the SSR is HIGH
     we force set it to LOW while trying to get a temp reading - IMPORTANT safety feature */
     setPumpOff();
     setBoilerOff();
+    setSteamBoilerRelayOff();
     if (millis() > thermoTimer) {
       LOG_ERROR("Cannot read temp from thermocouple (last read: %.1lf)!", static_cast<double>(currentState.temperature));
-      steamState() ? lcdShowPopup("COOLDOWN") : lcdShowPopup("TEMP READ ERROR"); // writing a LCD message
+      currentState.steamSwitchState ? lcdShowPopup("COOLDOWN") : lcdShowPopup("TEMP READ ERROR"); // writing a LCD message
       currentState.temperature  = thermocouple.readCelsius() - runningCfg.offsetTemp;  // Making sure we're getting a value
       thermoTimer = millis() + GET_KTYPE_READ_EVERY;
     }
@@ -621,47 +654,73 @@ void systemHealthCheck(float pressureThreshold) {
     lcdShowPopup("TURN STEAM OFF NOW!");
     setPumpOff();
     setBoilerOff();
-    currentState.isSteamForgottenON = steamState();
+    setSteamBoilerRelayOff();
+    currentState.isSteamForgottenON = currentState.steamSwitchState;
   }
 
   //Releasing the excess pressure after steaming or brewing if necessary
   #if defined LEGO_VALVE_RELAY || defined SINGLE_BOARD
 
   // No point going through the whole thing if this first condition isn't met.
-  if (waterState()) return;
-
+  if (currentState.brewSwitchState || currentState.steamSwitchState || currentState.hotWaterSwitchState) {
+    systemHealthTimer = millis() + HEALTHCHECK_EVERY;
+    return;
+  }
   // Should enter the block every "systemHealthTimer" seconds
   if (millis() >= systemHealthTimer) {
     while (currentState.smoothedPressure >= pressureThreshold && currentState.temperature < 100.f)
     {
       //Reloading the watchdog timer, if this function fails to run MCU is rebooted
       watchdogReload();
-      switch (lcdCurrentPageId) {
-        case 2:
-        case 8:
+      switch (static_cast<SCREEN_MODES>(lcdCurrentPageId)) {
+        case SCREEN_MODES::SCREEN_brew_manual:
+        case SCREEN_MODES::SCREEN_brew_graph:
+          brewDetect();
+          lcdRefresh();
+          lcdListen();
           sensorsRead();
-          setPumpOff();
-          setBoilerOff();
+          justDoCoffee(runningCfg, currentState, brewActive, preinfusionFinished);
           break;
         default:
           sensorsRead();
           lcdShowPopup("Releasing pressure!");
           setPumpOff();
           setBoilerOff();
+          setSteamValveRelayOff();
+          setSteamBoilerRelayOff();
           openValve();
           break;
       }
     }
-    sensorsRead();
     closeValve();
     systemHealthTimer = millis() + HEALTHCHECK_EVERY;
+  }
+  // Throwing a pressure release countodown.
+  if (static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_graph) return;
+  if (static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_brew_manual) return;
+
+  if (currentState.smoothedPressure >= pressureThreshold && currentState.temperature < 100.f) {
+    if (millis() >= systemHealthTimer - 3500ul && millis() <= systemHealthTimer - 500ul) {
+      char tmp[25];
+      int countdown = (int)(systemHealthTimer-millis())/1000;
+      unsigned int check = snprintf(tmp, sizeof(tmp), "Dropping beats in: %i", countdown);
+      if (check > 0 && check <= sizeof(tmp)) {
+        lcdShowPopup(tmp);
+      }
+    }
   }
   #endif
 }
 
 void fillBoiler() {
   #if defined LEGO_VALVE_RELAY || defined SINGLE_BOARD
+
   if (startupInitFinished) {
+    return;
+  }
+
+  if (currentState.temperature > BOILER_FILL_SKIP_TEMP) {
+    startupInitFinished = true;
     return;
   }
 
@@ -669,7 +728,7 @@ void fillBoiler() {
     fillBoilerUntilThreshod(getTimeSinceInit());
   }
   else if (isSwitchOn()) {
-    lcdShowPopup("Brew Switch ON!!");
+    lcdShowPopup("Brew Switch ON!");
   }
 #else
   startupInitFinished = true;
@@ -683,9 +742,9 @@ bool isBoilerFillPhase(unsigned long elapsedTime) {
 bool isBoilerFull(unsigned long elapsedTime) {
   bool boilerFull = false;
   if (elapsedTime > BOILER_FILL_START_TIME + 1000UL) {
-    boilerFull =  (previousSmoothedPressure - currentState.smoothedPressure > -0.05f)
+    boilerFull =  (previousSmoothedPressure - currentState.smoothedPressure > -0.02f)
                 &&
-                  (previousSmoothedPressure - currentState.smoothedPressure < 0.05f);
+                  (previousSmoothedPressure - currentState.smoothedPressure < 0.001f);
   }
 
   return elapsedTime >= BOILER_FILL_TIMEOUT || boilerFull;
@@ -699,7 +758,7 @@ unsigned long getTimeSinceInit() {
 
 // Checks if Brew switch is ON
 bool isSwitchOn() {
-  return brewState() && static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_home;
+  return currentState.brewSwitchState && static_cast<SCREEN_MODES>(lcdCurrentPageId) == SCREEN_MODES::SCREEN_home;
 }
 
 void fillBoilerUntilThreshod(unsigned long elapsedTime) {
@@ -722,4 +781,17 @@ void fillBoilerUntilThreshod(unsigned long elapsedTime) {
 
 void updateStartupTimer() {
   lcdSetUpTime(getTimeSinceInit() / 1000);
+}
+
+void cpsInit(eepromValues_t &eepromValues) {
+  int cps = getCPS();
+  if (cps > 110) { // double 60 Hz
+    eepromValues.powerLineFrequency = 60u;
+  } else if (cps > 80) { // double 50 Hz
+    eepromValues.powerLineFrequency = 50u;
+  } else if (cps > 55) { // 60 Hz
+    eepromValues.powerLineFrequency = 60u;
+  } else if (cps > 0) { // 50 Hz
+    eepromValues.powerLineFrequency = 50u;
+  }
 }

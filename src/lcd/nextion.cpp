@@ -1,6 +1,8 @@
+/* 09:32 15/03/2023 - change triggering comment */
 #include "lcd.h"
 #include "pindef.h"
 #include "log.h"
+#include <Arduino.h>
 
 EasyNex myNex(USART_LCD);
 volatile int lcdCurrentPageId;
@@ -215,15 +217,17 @@ void lcdSetUpTime(float val) {
   myNex.writeNum("systemUpTime", val);
 }
 
-void lcdSetTemperature(int val) {
+void lcdSetTemperature(uint16_t val) {
   myNex.writeNum("currentTemp", val);
 }
 
 void lcdSetWeight(float val) {
-  char tmp[5];
+  char tmp[6];
   int check = snprintf(tmp, sizeof(tmp), "%.1f", static_cast<double>(val));
-  if (check > 0 && check <= sizeof(tmp))
+  if (check > 0 && static_cast<unsigned int>(check) <= sizeof(tmp)) {
+    strcat(tmp, "g");
     myNex.writeStr("weight.txt", tmp);
+  }
 }
 
 void lcdSetFlow(int val) {
